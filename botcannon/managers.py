@@ -192,7 +192,7 @@ class ParameterManager(ModelWithName):
             if not args:
                 print(f'No args!')
             for k in args:
-                pswd = getpass.getpass(f'{k} :')
+                pswd = getpass.getpass(f'{name}->{k} :')
                 conf.data[k] = pswd
                 print(f'OK\n')
         else:
