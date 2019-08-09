@@ -30,7 +30,6 @@ def run_plugin_with_cmd(item, namespace):
     runner, r_params = cannon.render.get_runner(**cannon_data)
     print(item)
     runner(**r_params).send(**item)
-
     print()
 
 
@@ -47,26 +46,24 @@ def read_and_process_cg(namespace, service_name, consumer_name, count, block):
     cannon = botcannon.MainCannon(namespace, Database(unix_socket_path='/run/redis/redis-server.sock'))
     ledger = cannon.ledger(service_name, consumer_name)
     proccess_name = current_process().name
-
-    def parse_work(msg):
-        for i in msg:
-            p = i.data
-            cannon_data = cannon.render.dict(p['service_name'], hardfail=True)
-            runner, params = cannon.render.get_runner(**cannon_data)
-            yield runner.default_parse(i)
+    consumer = ledger.ts.consumer(consumer_name)
 
     while True:
         procs = []
-        work = ledger.ts.consumer(consumer_name).read(count=count, block=block)
-        # if work:
-        for workload in parse_work(work):
-            if workload:
-                proc = Process(name=f'{proccess_name}.{len(procs) + 1}',
-                               target=run_plugin_with_cmd,
-                               args=(workload, namespace))
-                procs.append(proc)
-                proc.start()
-        print('')
+        msgs = consumer.read(count=count, block=block)
+        for message in msgs:
+            if message:
+                p = message.data
+                cannon_data = cannon.render.dict(p['service_name'], hardfail=True)
+                runner, params = cannon.render.get_runner(**cannon_data)
+                to_send = runner.default_parse(message)
+                if to_send:
+                    proc = Process(name=f'{proccess_name}.{len(procs) + 1}',
+                                   target=run_plugin_with_cmd,
+                                   args=(to_send, namespace))
+                    procs.append(proc)
+                    proc.start()
+                ledger.cg_streams['inbox'].ack(message.message_id)
         # for proc in procs:
         #     proc.join()
 
