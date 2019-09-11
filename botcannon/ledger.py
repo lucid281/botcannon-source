@@ -186,14 +186,14 @@ class CannonLedger:
         """
         if channel in self.cg_streams:
             cg = self.cg_streams[channel]
+            p = {'service_name': self.service_name,
+                 'data': json.dumps(data),
+                 'status': status}
+            cg.add(p, id=ts) if ts else cg.add(p)
         else:
             print('No consumer group to write to, exiting.')
             exit(1)
 
-        p = {'service_name': self.service_name,
-             'data': json.dumps(data),
-             'status': status}
-        cg.add(p, id=ts) if ts else cg.add(p)
 
     def all_cgs(self):
         a = []
