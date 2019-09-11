@@ -30,7 +30,6 @@ def run_plugin_with_cmd(item, namespace):
     runner, r_params = cannon.render.get_runner(**cannon_data)
     print(item)
     runner(**r_params).send(**item)
-
     print()
 
 
@@ -47,26 +46,23 @@ def read_and_process_cg(namespace, service_name, consumer_name, count, block):
     cannon = botcannon.MainCannon(namespace, Database(unix_socket_path='/run/redis/redis-server.sock'))
     ledger = cannon.ledger(service_name, consumer_name)
     proccess_name = current_process().name
-
-    def parse_work(msg):
-        for i in msg:
-            p = i.data
-            cannon_data = cannon.render.dict(p['service_name'], hardfail=True)
-            runner, params = cannon.render.get_runner(**cannon_data)
-            yield runner.default_parse(i)
+    consumer = ledger.ts.consumer(consumer_name)
 
     while True:
         procs = []
-        work = ledger.ts.consumer(consumer_name).read(count=count, block=block)
-        # if work:
-        for workload in parse_work(work):
-            if workload:
+        msgs = consumer.read(count=count, block=block)
+        for message in msgs:
+            print(message)
+            cannon_data = cannon.render.dict(message.data['service_name'], hardfail=True)
+            runner, params = cannon.render.get_runner(**cannon_data)
+            m = runner.default_parse(message)
+            if m:
                 proc = Process(name=f'{proccess_name}.{len(procs) + 1}',
-                               target=run_plugin_with_cmd,
-                               args=(workload, namespace))
+                           target=run_plugin_with_cmd,
+                           args=(m, namespace))
                 procs.append(proc)
                 proc.start()
-        print('')
+            ledger.cg_streams['inbox'].ack(message.message_id)
         # for proc in procs:
         #     proc.join()
 
@@ -90,9 +86,10 @@ def read_and_process_backlog(namespace, service_name, consumer_name):
     procs = []
     proccess_name = current_process().name
     for msg in claim_pending():
+        print(msg)
         proc = Process(name=f'{proccess_name}.{len(procs) + 1}',
                        target=run_plugin_with_cmd,
-                       args=msg,
+                       args=(msg, namespace),
                        )
         proc.start()
 
@@ -236,23 +233,6 @@ class CannonLedger:
             print('.', end='')
 
     def worker(self, backlogged=False):
-
-        # def claim_pending(count=1):
-        #     backlogged_cg = self.get_pending(count)
-        #     for stream in backlogged_cg:
-        #         cg = self._get_cg(stream)
-        #         for i in backlogged_cg[stream]:
-        #             ts, seq, group, age, delivered = self.parse_pending(i)
-        #             msgs = cg.claim(datetime_to_id(ts, seq))
-        #             for msg in msgs:
-        #                 print(msg)
-        #                 yield msg
-
-        # worker_count = int(psutil.cpu_count(logical=False) / 2)  # half cpu cores seems to work best
-        #
-        # consumer_name = f'{self.consumer_name}'
-        # consumer = self.ts.consumer(consumer_name)
-
         import multiprocessing as mp
 
         mp.set_start_method('fork')
@@ -363,7 +343,7 @@ class CannonLedger:
             print('')
 
     def ack(self, stream, *args):
-        stripped = stream.replace(":", "_").replace("|", "_").lower()
+        stripped = stream.replace("-", "_").replace(":", "_").replace("|", "_").lower()
         # stripped = stripped
         if stripped in self.ts.__dict__ and isinstance(self.ts.__dict__[stripped], TimeSeriesStream):
             return [self.ts.__dict__[stripped].ack(i) for i in args]
@@ -376,36 +356,6 @@ class CannonLedger:
             s = self.cg_streams[cg_stream]
             return s.claim(id)
 
-
-# def process_list(_list):
-#     """Take a list of messages and process them"""
-#     proccess_name = current_process().name
-#     buf = [f'Processing {len(_list)} items with {proccess_name}:']
-#     [buf.append(
-#         call_runner_parse(m)) for m in _list]
-#     print('\n'.join(buf))
-#     exit(1)
-
-# def split_workload(_list, div_by):
-#     length = len(_list)
-#     if div_by >= length:
-#         return [_list]
-#     return [_list[i * length // div_by: (i + 1) * length // div_by]
-#             for i in range(div_by)]
-
-# def factor_up_procs(messages, threads: int):
-#     ct = 0
-#     procs = []
-#     proccess_name = current_process().name
-#     for workload in split_workload(messages, threads):
-#         proc = Process(name=f'{proccess_name}.{len(procs) + 1}',
-#                        target=process_list,
-#                        args=(workload,))
-#         procs.append(proc)
-#         proc.start()
-#
-#     for proc in procs:
-#         proc.join()
 
 def now():
     import datetime
