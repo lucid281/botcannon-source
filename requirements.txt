@@ -2,5 +2,8 @@
 psutil
 fire==0.1.3
 walrus
-slackclient==1.3.2
 python-dateutil
+ruamel.yaml
+pandas
+scipy
+numpy

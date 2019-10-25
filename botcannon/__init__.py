@@ -1,158 +1,235 @@
-import importlib.util
-from pathlib import Path
+#!/usr/bin/env -S python3
 import inspect
-import os
+from pathlib import Path
+from getpass import getpass
+import datetime
+from time import sleep
+import multiprocessing as mp
 
 from walrus import Database
+from ruamel.yaml import YAML
 
-from .ledger import CannonLedger
-from .torch import Torch
+from .config import ConfigManager
+from .services import BotCannonService
+from .models import Collector
 
+class BotCannon:
+    """"""
+    def __init__(self, namespace='DEFAULT', lib_dir='./app'):
+        self._system_path = Path('/run/redis/redis-server.sock')  # or system
+        self._relative_path = Path('.') / 'sockets/redis-server.sock'
+        socket_path = self._system_path if self._system_path.exists() else None
+        if self._relative_path.exists():
+            socket_path = self._relative_path
+        if not socket_path:
+            print(f'No redis socket in {self._system_path} OR {self._relative_path}.')
+            exit(1)
+        self._socket_path = socket_path
+        self._namespace = namespace
+        self._lib_dir = lib_dir
+        self._service_kwargs = {}
+        self._service = None
 
-class MainCannon:
-    def __init__(self, name, db: Database):
-        from .models import Users
-        from .models import Groups
-        from .models import Services
-        from .models import Params
+    def shell(self, service_name):
+        """Call a ready-to-go shell as defined by your service."""
+        self.init(service_name)
+        shell, shell_params = self._service.get_shell()
+        return shell(**shell_params) if shell_params else shell()
 
-        from .managers import UserManager
-        from .managers import GroupManager
-        from .managers import ServiceManager
-        from .managers import ParameterManager
+    def collector(self, service_name):
+        """Call a ready-to-go collector as defined by your service."""
+        self.init(service_name)
+        collector, collector_params = self._service.get_collector()
+        return collector(**collector_params) if collector_params else collector()
 
-        self.name = name
-        users = Users
-        groups = Groups
-        services = Services
-        params = Params
+    def service(self, service_name: object) -> BotCannonService:
+        """For working with a service more intimately."""
+        self.init(service_name)
+        return self._service
 
-        self.db = db
-        for item in [users, groups, services, params]:
-            item.__database__ = self.db
-            item.__namespace__ = name
+    def init(self, service_name):
+        """To delay connections to redis"""
+        from importlib import reload
+        paths_dict = {}
 
-        self.users = UserManager(users)
-        self.groups = GroupManager(groups)
-        self.service = ServiceManager(services)
-        self.params = ParameterManager(params)
+        for py_file in Path(self._lib_dir).iterdir():
+            if py_file.is_file() and py_file.suffix == '.py':
+                paths_dict[py_file.stem] = py_file
 
-        self.render = ServiceRenderer(self)
+        self._service_kwargs = {
+            'namespace': self._namespace,
+            'paths_dict': paths_dict,
+            'socket_path': self._socket_path,
+            'lib_dir': self._lib_dir,
+            'hardfail': True,
+        }
 
-    def ledger(self, service, consumer_name='default'):
-        return CannonLedger(self, service, consumer_name)
+        self._service = BotCannonService(service_name, **self._service_kwargs)
+        return self._service
 
+    def up(self, service_name, lazy=False):
+        from .multiprocess import ManageWorkers
 
-class ServiceRenderer:
-    def __init__(self, cannon: MainCannon):
-        self._db = cannon
-        self.plugins = self.populate_py_in_dir(f'bots')
-        self.runners = self.populate_py_in_dir(f'runners', in_module=True)
+        s = self.init(service_name)
+        q = mp.Queue(maxsize=2)
+        p = ManageWorkers(s.ledger.service_name, q, 60)
 
-    @staticmethod
-    def populate_py_in_dir(path, in_module=False):
-        _plugins = {}
-        where_am_i = inspect.getframeinfo(inspect.currentframe()).filename
-        cannon_dir = os.path.dirname(os.path.abspath(where_am_i))
-        paths = Path(cannon_dir) / path if in_module else Path(path)
+        print("Initializing collector process")
+        collector, collector_params = s.get_collector()
+        c = collector(**collector_params) if collector_params else collector()
 
-        for py_file in paths.iterdir():
-            if py_file.is_file():
-                name = py_file.resolve().stem
-                if in_module:
-                    plugin = f'botcannon.{path}.{name}'
-                else:
-                    plugin = f'{path}.{name}'
-                spec = importlib.util.find_spec(plugin)
-                if spec:
-                    _plugins[name] = spec
-        return _plugins
+        try:
+            while True:
+                t = True
+                for data in c.read():
+                    if data:
+                        if not lazy:
+                            q.put('hot')
+                            t = False
+                        s.ledger.write('data', data)
 
-    def dict(self, service_name, hardfail=False):
-        # gotta start somewhere -- query the db
-        service_definition = self._db.service.get(service_name)
-        if not service_definition:
-            print(f'No service named "{service_name}"')
-            return exit(1) if hardfail else ()
+                for taskback in s.ledger.channels["taskback"].read(block=None):
+                    c.taskback(taskback)
+                    s.ledger.channels["taskback"].ack(taskback.message_id)
+                    t = False
 
-        # test for missing keys in returned service config object
-        keys_required = ['plugin', 'entrypoint', 'entry_config', 'runner', 'run_config']
-        key_test = [i for i in service_definition._data if i in keys_required]
-        if not key_test:
-            print(f'Service named "{service_name}" missing {key_test}')
-            return exit(1) if hardfail else ()
+                if t:
+                    q.put('loop_done')
+                    sleep(0.005)
 
-        # see if plugin exists in ./plugins/NAME.py
-        # plugins = self.populate_py_in_dir(self.plugins_dir)
-        if service_definition.plugin not in self.plugins:
-            print(f'No plugin named {service_definition.plugin}.')
-            return exit(1) if hardfail else ()
-        plugin_spec = self.plugins[service_definition.plugin]
+        except KeyboardInterrupt:
+            print("Caught KeyboardInterrupt, terminating consumer")
+            q.put('killjobs')
 
-        # get config for entry point
-        plugin_config = self._db.params.get(service_definition.entry_config)
-        if not plugin_config:
-            print(f'parameter entry named {service_definition.entry_config} not found.\n'
-                  f'    Create with "su params add {service_definition.entry_config}"')
-            return exit(1) if hardfail else ()
+        finally:
+            q.put(None)
+            q.close()
+            p.join()
+            p.terminate()
 
-        # check for run context class
-        # runners = self.populate_py_in_dir(self.runner_dir)
-        if service_definition.runner not in self.runners:
-            print(f'No runner plugin named {service_definition.runner}.')
-            return exit(1) if hardfail else ()
-        runner_spec = self.runners[service_definition.runner]
+    def yml(self, file_name, overwrite=True):
 
-        # get config for run context entry point
-        runner_config = self._db.params.get(service_definition.run_config)
-        if not runner_config:
-            print(f'Config for {service_definition.runner} named {service_definition.run_config} not found.\n'
-                  f'    Create with "su params add {service_definition.run_config}"')
-            return exit(1) if hardfail else ()
+        y = YAML()
+        compose = y.load(Path(file_name))
 
-        return {'service_conf': service_definition,
-                'plugin_spec': plugin_spec,
-                'plugin_config': plugin_config,
-                'runner_spec': runner_spec,
-                'runner_config': runner_config,
-                }
+        if not 'services' in compose:
+            print('No "services" key at top level of ! Exiting!')
+            exit(1)
 
-    def get_plugin(self, plugin_spec, plugin_config, **kwargs):
-        return self.get_entry(plugin_spec, plugin_config)
+        conf = ConfigManager(
+            namespace=self._namespace,
+            db=Database(
+                unix_socket_path=str(
+                    self._socket_path.resolve())))
 
-    def get_runner(self, runner_spec, runner_config, **kwargs):
-        return self.get_entry(runner_spec, runner_config)
+        root = compose['services']
 
-    def get_entry(self, inital_py_code, config_hash, checks=True, **kwargs):
-        # hijack python's import system
-        service = importlib.util.module_from_spec(inital_py_code)
-        inital_py_code.loader.exec_module(service)
+        service_function_keys = ['collector', 'shell']
+        service_config_keys = ['file', 'entry', 'conf']
 
-        def check_class_parameters(cls, config):
-            params = {}
-            service_sig = inspect.signature(cls.__init__).parameters
-            failed = [i for i in service_sig if (i not in config.data and i is not 'self')]
-            passed = [i for i in service_sig if i in config.data]
-            if failed:
-                print(f'Parameter object is missing key(s):\n'
-                      f'    Create with "su params paste {config.name} ', end='')
-                print(' '.join(i for i in failed), end='"\n')
+        if overwrite:
+            print(f'Overwriting existing configs.')
+            # TODO: Clear configs
+
+        for service_name in root:
+            if not isinstance(service_name, str):
+                print('service_name is not a string! exiting!')
                 exit(1)
+
+            check = conf.service.get(service_name)
+            if not check or overwrite:
+                print(f'{service_name}:')
+                conf.service.add(service_name)
+
+            yml_service = root[service_name]
+            missing_service_keys = [i for i in service_function_keys if i not in yml_service]
+            if missing_service_keys:
+                print(f'  Missing the following keys:  {missing_service_keys}.')
+                exit(1)
+
+            missing_task_conf_keys = [
+                [x for x in service_config_keys if x not in yml_service[i]]
+                for i in service_function_keys
+            ]
+            if [i for i in missing_task_conf_keys if i]:
+                print(f'  Missing the following keys:  {missing_task_conf_keys}.')
+                exit(1)
+
+            defined = {
+                "service_name": service_name,
+                "collector": yml_service["collector"]["file"],
+                "c_entry": yml_service["collector"]["entry"],
+                "c_conf": yml_service["collector"]["conf"]["key"],
+                "shell": yml_service["shell"]["file"],
+                "s_entry": yml_service["shell"]["entry"],
+                "s_conf": yml_service["shell"]["conf"]["key"],
+            }
+            service_model = conf.service.define(**defined)
+
+            def get_secret(key):
+                # return input(f'  {service_name}->{key}: ')
+                return getpass(f'  "{key}": ')
+
+            module_kwargs = {
+                "collector": yml_service["collector"]["conf"],
+                "shell": yml_service["shell"]["conf"]
+            }
+
+            for module in module_kwargs:
+                if "key" not in module_kwargs[module]:
+                    print(f'Need a "key" entry in {service_name}:{module}:conf')
+                    exit(1)
+                if "kwargs" not in module_kwargs[module]:
+                    if not conf.params.get(module_kwargs[module]["key"]):
+                        print(f'No kwargs for {service_name}:{module}:conf found in Redis.\n'
+                              f'Specify key+kwargs higher up in yml to reuse key')
+                        exit(1)
+                    else:
+                        continue
+                else:
+                    print(f'  {module}:', [i for i in module_kwargs[module]["kwargs"]])
+                    conf.params.add(module_kwargs[module]["key"])
+                    secrets = {i: get_secret(i) for i in module_kwargs[module]["kwargs"]
+                               if module_kwargs[module]["kwargs"][i] == "!!SECRET!!"}
+                    from_yml = {i: module_kwargs[module]["kwargs"][i] for i in module_kwargs[module]["kwargs"]
+                                if i not in secrets}
+                    conf.params.kv(module_kwargs[module]["key"], **{**from_yml, **secrets})
+
+            if 'tasks' in yml_service:
+                missing_task_conf_keys = [
+                    [{i: x} for x in service_config_keys if x not in yml_service["tasks"][i]]
+                    for i in yml_service["tasks"]
+                ]
+                if [i for i in missing_task_conf_keys if i]:
+                    print(f'    task is missing following:  {" ".join(str(i) for i in missing_task_conf_keys)}.')
+                    exit(1)
+
+                for task_name in yml_service["tasks"]:
+                    task = yml_service["tasks"][task_name]
+                    conf.params.add(task["conf"]["key"])
+                    secrets = {i: get_secret(i) for i in task["conf"]["kwargs"]
+                               if task["conf"]["kwargs"][i] == "!!SECRET!!"}
+                    from_yml = {i: task["conf"]["kwargs"][i] for i in task["conf"]["kwargs"]
+                                if i not in secrets}
+                    conf.params.kv(task["conf"]["key"], **{**from_yml, **secrets})
+
+                service_model.tasks = yml_service["tasks"]
             else:
-                [params.setdefault(i, config.data[i].decode()) for i in passed]
+                service_model.tasks = {}
+            service_model.save()
 
-            return cls, params
+    def ls(self):
+        # _services = [i for i in self.su.service.all()]
+        # if not _services:
+        #     return f'No services defined. Run "services define".'
+        #
+        # b = [''.join(f'{i:<20}' for i in ['name', 'plugin', 'entry_config', 'runner', 'run_config', 'autostart'])]
+        # [b.append(f'{s.name:<19} {s.plugin:<19} {s.entry_config:<19} {s.get_collector:<19}'
+        #           f' {s.run_config:<19} {s.autostart}') for s in _services]
+        #
+        # return '\n'.join([str(i) for i in b])
+        pass  # this command doesnt work anymore, needs tweaks
 
-        # look for our entry point
-        if '_entrypoint_' in service.__dict__:
-            entry_name = service._entrypoint_
-            service_class = service.__dict__[entry_name]
-        else:
-            print(f'Entrypoint not found in service')
-            return False
+    def help(self):
+        return inspect.getdoc(self)
 
-        # make sure we can call plugin and finally return it
-        if checks:
-            return check_class_parameters(service_class, config_hash)
-        else:
-            return service_class, config_hash
